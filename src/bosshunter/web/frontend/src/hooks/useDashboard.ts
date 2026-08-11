@@ -31,6 +31,16 @@ interface Job {
   updated_at?: string
   resume_path?: string
   last_error?: string
+  score_evidence?: {
+    salary_assessment?: 'pass' | 'warning' | 'fail' | 'not_provided'
+    evidence_mapping?: Array<{
+      requirement: string
+      category?: string
+      evidence?: string
+      match?: string
+      gap?: string
+    }>
+  } | null
 }
 
 interface TopCompany {
@@ -41,7 +51,7 @@ interface TopCompany {
 
 interface WorkbenchTask {
   id: string
-  mode: 'full' | 'collect' | 'rescore' | 'monitor' | 'deliver'
+  mode: 'full' | 'collect' | 'rescore' | 'score' | 'monitor' | 'deliver'
   label: string
   status: string
   logs: string[]
@@ -49,6 +59,7 @@ interface WorkbenchTask {
   deadline_at?: string
   stop_reason?: string
   stop_requested: boolean
+  can_resume?: boolean
 }
 
 interface WorkbenchData {
@@ -112,7 +123,7 @@ export function useDashboard(scope: DashboardDataScope = 'all') {
       const fetchOptions = { cache: 'no-store' as const }
       const [workbenchRes, jobsRes, historyRes] = await Promise.all([
         needsWorkbench ? fetch('/api/workbench', fetchOptions) : Promise.resolve(null),
-        needsJobs ? fetch('/api/jobs?limit=100', fetchOptions) : Promise.resolve(null),
+        needsJobs ? fetch('/api/jobs?limit=0', fetchOptions) : Promise.resolve(null),
         needsHistory ? fetch('/api/history?limit=50&include_unresolved=1', fetchOptions) : Promise.resolve(null),
       ])
       const [workbenchData, jobsData, historyData] = await Promise.all([
@@ -133,11 +144,11 @@ export function useDashboard(scope: DashboardDataScope = 'all') {
     }
   }
 
-  const startTask = async (mode: 'full' | 'collect' | 'rescore' | 'monitor' | 'deliver') => {
+  const startTask = async (mode: 'full' | 'collect' | 'rescore' | 'score' | 'monitor' | 'deliver', jobIds: string[] = []) => {
     const res = await fetch('/api/workbench/task', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode }),
+      body: JSON.stringify({ mode, job_ids: jobIds }),
     })
     if (!res.ok) {
       const data = await res.json().catch(() => ({}))
@@ -156,13 +167,53 @@ export function useDashboard(scope: DashboardDataScope = 'all') {
     await fetchAll()
   }
 
+  const pauseTask = async (taskId: string) => {
+    const res = await fetch(`/api/workbench/task/${taskId}/pause`, { method: 'POST' })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.error || '暂停失败')
+    }
+    await fetchAll()
+  }
+
+  const resumeTask = async (taskId: string) => {
+    const res = await fetch(`/api/workbench/task/${taskId}/resume`, { method: 'POST' })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      const details = Array.isArray(data.messages) ? data.messages.map(String).filter(Boolean).join('，') : ''
+      throw new Error([data.error || '继续任务失败', details].filter(Boolean).join('：'))
+    }
+    await fetchAll()
+  }
+
+  const deleteTask = async (taskId: string) => {
+    const res = await fetch(`/api/workbench/task/${taskId}`, { method: 'DELETE' })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.error || '删除任务卡失败')
+    }
+    await fetchAll()
+  }
+
   useEffect(() => {
     fetchAll()
     const interval = setInterval(fetchAll, 5000)
     return () => clearInterval(interval)
   }, [])
 
-  return { workbench, jobs, history, loading, error, refresh: fetchAll, startTask, stopTask }
+  return {
+    workbench,
+    jobs,
+    history,
+    loading,
+    error,
+    refresh: fetchAll,
+    startTask,
+    stopTask,
+    pauseTask,
+    resumeTask,
+    deleteTask,
+  }
 }
 
 export type { FunnelData, ActivityData, Job, TopCompany, WorkbenchData, WorkbenchTask, HistoryDetailPayload, HistoryItem }

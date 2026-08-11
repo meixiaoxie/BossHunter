@@ -70,16 +70,20 @@ DEFAULTS: dict[str, Any] = {
         "salary_max": 0,
         "allow_internship": False,
         "deal_breakers": [],
-        "allow_internship": False,
+        "blocked_companies": [],
     },
     "search": {
         "keywords": [],
         "cities": [],  # Empty = fallback to profile.target_cities
+        "city_codes": {},
         "max_pages": 3,
+        "collection_concurrency": 1,
     },
     "scoring": {
         "threshold": 71,
+        "low_score_delete_threshold": 50,
         "max_candidates": 20,
+        "deep_scoring": False,
     },
     "throttle": {
         "daily_limit": 30,
@@ -105,6 +109,7 @@ DEFAULTS: dict[str, Any] = {
         "greeting_max_attempts": 2,
         "greeting_review_threshold": 7.0,
         "greeting_max_iterations": 2,
+        "scoring_concurrency": 3,
     },
     "monitor": {
         "interval": 30,  # 分钟
@@ -140,9 +145,64 @@ def load_config(config_path: Path | None = None) -> dict[str, Any]:
     if config_path.exists():
         with open(config_path, encoding="utf-8") as f:
             user_cfg = yaml.safe_load(f) or {}
-        _deep_merge(cfg, user_cfg)
+        if isinstance(user_cfg, dict):
+            _deep_merge(cfg, user_cfg)
+    normalize_scoring_config(cfg)
     _validate_ai_provider(cfg)
     return cfg
+
+
+def normalize_scoring_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Normalize score thresholds shared by config loading and API writes."""
+    for section, defaults in DEFAULTS.items():
+        if isinstance(defaults, dict) and not isinstance(config.get(section), dict):
+            config[section] = _deep_copy_dict(defaults)
+
+    scoring = config.setdefault("scoring", {})
+    raw_delete_threshold = scoring.get("low_score_delete_threshold", 50)
+    try:
+        delete_threshold = int(raw_delete_threshold)
+    except (TypeError, ValueError):
+        delete_threshold = 50
+    scoring["low_score_delete_threshold"] = max(0, min(delete_threshold, 100))
+    raw_deep_scoring = scoring.get("deep_scoring", False)
+    if isinstance(raw_deep_scoring, str):
+        scoring["deep_scoring"] = raw_deep_scoring.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        scoring["deep_scoring"] = bool(raw_deep_scoring)
+    search = config["search"]
+    search["collection_concurrency"] = get_collection_concurrency(config)
+    return config
+
+
+def get_collection_concurrency(config: dict[str, Any]) -> int:
+    """Return the bounded collection worker count."""
+    search = config.get("search", {})
+    raw_value = search.get("collection_concurrency", 1) if isinstance(search, dict) else 1
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        value = 1
+    return max(1, min(value, 3))
+
+
+def find_unreadable_search_values(config: dict[str, Any]) -> dict[str, int]:
+    """Count search values that have already been lost to question-mark encoding."""
+    search = config.get("search", {}) if isinstance(config, dict) else {}
+    if not isinstance(search, dict):
+        return {}
+    warnings: dict[str, int] = {}
+    for field in ("keywords", "cities"):
+        values = search.get(field, [])
+        if not isinstance(values, list):
+            continue
+        count = sum(
+            isinstance(value, str) and bool(value) and set(value) == {"?"}
+            for value in values
+        )
+        if count:
+            warnings[field] = count
+    return warnings
 
 
 def _validate_ai_provider(config: dict[str, Any]) -> None:

@@ -7,6 +7,8 @@ import type { Job } from '@/hooks/useDashboard'
 
 interface JobsTableProps {
   jobs: Job[]
+  selectedIds?: string[]
+  onSelectionChange?: (ids: string[]) => void
 }
 
 function statusVariant(status: string) {
@@ -28,12 +30,24 @@ function statusVariant(status: string) {
   return variants.has(status) ? status : 'default'
 }
 
-export function JobsTable({ jobs }: JobsTableProps) {
+export function JobsTable({ jobs, selectedIds = [], onSelectionChange }: JobsTableProps) {
   const [page, setPage] = useState(0)
   const [expanded, setExpanded] = useState<string | null>(null)
   const pageSize = 15
   const totalPages = Math.ceil(jobs.length / pageSize)
   const displayed = jobs.slice(page * pageSize, (page + 1) * pageSize)
+  const selectableJobs = displayed.filter(job => job.status === 'pending')
+  const toggleSelection = (id: string) => {
+    if (!onSelectionChange) return
+    onSelectionChange(selectedIds.includes(id) ? selectedIds.filter(item => item !== id) : [...selectedIds, id])
+  }
+  const toggleAllSelection = () => {
+    if (!onSelectionChange) return
+    const allSelected = selectableJobs.length > 0 && selectableJobs.every(job => selectedIds.includes(job.id))
+    onSelectionChange(allSelected
+      ? selectedIds.filter(id => !selectableJobs.some(job => job.id === id))
+      : [...new Set([...selectedIds, ...selectableJobs.map(job => job.id)])])
+  }
 
   const getScoreColor = (score: number) => {
     if (score >= 80) return 'text-success'
@@ -61,6 +75,7 @@ export function JobsTable({ jobs }: JobsTableProps) {
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-card-border bg-[#FFF0E5] text-xs text-muted">
+                {onSelectionChange && <th className="px-4 py-3 text-left font-bold"><input aria-label="选择待评分岗位" type="checkbox" checked={selectableJobs.length > 0 && selectableJobs.every(job => selectedIds.includes(job.id))} onChange={toggleAllSelection} /></th>}
                 <th className="px-4 py-3 text-left font-bold">公司</th>
                 <th className="px-4 py-3 text-left font-bold">职位</th>
                 <th className="px-4 py-3 text-left font-bold">薪资</th>
@@ -72,12 +87,15 @@ export function JobsTable({ jobs }: JobsTableProps) {
             <tbody>
               {displayed.map(job => {
                 const isExpanded = expanded === job.id
+                const evidence = job.score_evidence
+                const evidenceMapping = evidence?.evidence_mapping ?? []
                 return (
                   <Fragment key={job.id}>
                     <tr
                       className="cursor-pointer border-b border-card-border bg-white transition-colors hover:bg-[#FFFCFA]"
                       onClick={() => setExpanded(isExpanded ? null : job.id)}
                     >
+                      {onSelectionChange && <td className="px-4 py-3"><input aria-label={`选择 ${job.title}`} type="checkbox" disabled={job.status !== 'pending'} checked={selectedIds.includes(job.id)} onClick={event => event.stopPropagation()} onChange={() => toggleSelection(job.id)} /></td>}
                       <td className="px-4 py-3">
                         <div className="flex items-center gap-2">
                           <span className="max-w-[160px] truncate font-black text-foreground">{job.company}</span>
@@ -103,7 +121,7 @@ export function JobsTable({ jobs }: JobsTableProps) {
                     </tr>
                     {isExpanded && (
                       <tr className="border-b border-card-border bg-[#FFFCFA]">
-                        <td colSpan={6} className="px-6 py-4">
+                        <td colSpan={onSelectionChange ? 7 : 6} className="px-6 py-4">
                           <div className="grid grid-cols-1 gap-4 text-sm lg:grid-cols-3">
                             <div className="rounded-2xl border border-card-border bg-white p-4">
                               <p className="mb-2 text-xs font-black text-primary">JD摘要</p>
@@ -118,6 +136,25 @@ export function JobsTable({ jobs }: JobsTableProps) {
                               <p className="line-clamp-6 whitespace-pre-wrap leading-6 text-muted">{job.score_reason || '无'}</p>
                             </div>
                           </div>
+                          {evidence && (
+                            <div className="mt-4 rounded-2xl border border-card-border bg-white p-4">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <p className="text-xs font-black text-primary">深度评分证据</p>
+                                <span className="text-xs text-muted">薪资判断：{evidence.salary_assessment || 'not_provided'}</span>
+                              </div>
+                              {evidenceMapping.length > 0 ? (
+                                <div className="mt-3 space-y-3">
+                                  {evidenceMapping.map((item, index) => (
+                                    <div key={`${item.requirement}-${index}`} className="border-t border-card-border pt-3 first:border-t-0 first:pt-0">
+                                      <p className="font-bold text-foreground">{item.requirement}</p>
+                                      <p className="mt-1 leading-6 text-muted">证据：{item.evidence || '未提供'}</p>
+                                      <p className="leading-6 text-muted">匹配：{item.match || '未提供'}{item.gap ? `；缺口：${item.gap}` : ''}</p>
+                                    </div>
+                                  ))}
+                                </div>
+                              ) : <p className="mt-3 text-muted">本次深度评分未返回可核验的证据映射。</p>}
+                            </div>
+                          )}
                         </td>
                       </tr>
                     )}

@@ -47,9 +47,16 @@ class WebApiRouteTests(unittest.TestCase):
     def setUp(self):
         # Arrange
         self.original_base_dir = server.BASE_DIR
+        self.login_status_patch = patch.object(
+            server,
+            "get_boss_login_status",
+            return_value={"ready": True, "status": "logged_in"},
+        )
+        self.login_status_patch.start()
 
     def tearDown(self):
         # Cleanup
+        self.login_status_patch.stop()
         server.set_base_dir(self.original_base_dir)
 
     def _request(self, path: str, method: str = "GET"):
@@ -79,10 +86,16 @@ class WebApiRouteTests(unittest.TestCase):
             "wsgi.run_once": False,
         }
 
-        body = b"".join(
-            chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
-            for chunk in server.app(environ, start_response)
-        ).decode("utf-8")
+        response_iter = server.app(environ, start_response)
+        try:
+            body = b"".join(
+                chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
+                for chunk in response_iter
+            ).decode("utf-8")
+        finally:
+            close = getattr(response_iter, "close", None)
+            if close:
+                close()
         return status_headers["status"], status_headers["headers"], body
 
     def _upload_resume(self, filename: str, content: bytes, content_type: str):
@@ -336,6 +349,59 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertTrue(status.startswith("200"))
         self.assertIn("application/json", headers["Content-Type"])
         self.assertEqual([job["id"] for job in payload["pending_confirmation"]], ["ready-job"])
+
+    def test_web_api_jobs_deserializes_score_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, _job("evidence-job"))
+                update_job_score(
+                    db,
+                    "evidence-job",
+                    82,
+                    "good match",
+                    evidence={
+                        "salary_assessment": "pass",
+                        "evidence_mapping": [{"requirement": "Delivery", "match": "strong"}],
+                    },
+                )
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request("/api/jobs?limit=0")
+
+        self.assertTrue(status.startswith("200"))
+        payload = json.loads(body)
+        self.assertEqual(payload[0]["score_evidence"]["salary_assessment"], "pass")
+        self.assertEqual(payload[0]["score_evidence"]["evidence_mapping"][0]["match"], "strong")
+
+    def test_web_api_job_detail_and_workbench_serialize_score_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, _job("evidence-ready"))
+                update_job_score(
+                    db,
+                    "evidence-ready",
+                    82,
+                    "good match",
+                    evidence={"evidence_mapping": [{"requirement": "Skills", "gap": "None"}]},
+                )
+                update_job_status(db, "evidence-ready", "ready")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            detail_status, _, detail_body = self._request("/api/jobs/evidence-ready")
+            workbench_status, _, workbench_body = self._request("/api/workbench")
+
+        self.assertTrue(detail_status.startswith("200"))
+        self.assertTrue(workbench_status.startswith("200"))
+        self.assertEqual(json.loads(detail_body)["score_evidence"]["evidence_mapping"][0]["requirement"], "Skills")
+        self.assertEqual(json.loads(workbench_body)["pending_confirmation"][0]["score_evidence"]["evidence_mapping"][0]["gap"], "None")
 
     def test_web_api_full_task_stays_running_while_waiting_for_frontend_confirmation(self):
         # Arrange

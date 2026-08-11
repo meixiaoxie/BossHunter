@@ -1,6 +1,7 @@
 """AI Scorer - Match jobs against resume using Claude API."""
 
 import json
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from rich.console import Console
@@ -10,6 +11,7 @@ from bosshunter.ai.credentials import AIRequestError, call_anthropic_text, get_a
 from bosshunter.cancellation import run_cancellable
 from bosshunter.db import (
     add_history,
+    delete_job,
     get_db,
     get_jobs_by_status,
     reset_ai_filtered_jobs,
@@ -20,6 +22,36 @@ from bosshunter.db import (
 from bosshunter.ai.prefilter import quick_score
 
 console = Console()
+
+
+def get_scoring_concurrency(config: dict) -> int:
+    """Return a safe AI scoring worker count from configuration."""
+    raw_value = config.get("ai", {}).get("scoring_concurrency", 3)
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        value = 3
+    return max(1, min(value, 5))
+
+
+def get_low_score_delete_threshold(config: dict) -> int:
+    """Return the safe score below which a completed evaluation is removed."""
+    raw_value = config.get("scoring", {}).get("low_score_delete_threshold", 50)
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        value = 50
+    return max(0, min(value, 100))
+
+
+def is_deep_scoring(config: dict) -> bool:
+    """Return whether the opt-in evidence-based scoring contract is enabled."""
+    scoring = config.get("scoring", {}) if isinstance(config, dict) else {}
+    value = scoring.get("deep_scoring", False) if isinstance(scoring, dict) else False
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
 
 SCORING_PROMPT = """你是一位专业的求职顾问。请根据以下简历和岗位JD，评估候选人与该岗位的匹配度。
 
@@ -46,6 +78,54 @@ SCORING_PROMPT = """你是一位专业的求职顾问。请根据以下简历和
 
 请严格按以下JSON格式输出，不要输出其他内容：
 {{"score": 75, "reason": "匹配理由简述（50字内）", "missing": "缺失的关键技能或经验（30字内）"}}
+"""
+
+
+DEEP_SCORING_PROMPT = """You are an evidence-based job matching evaluator.
+Evaluate the resume against the job using only the supplied evidence.
+
+## Resume
+{resume}
+
+## Job input
+- Job title: {title}
+- Company: {company}
+- Salary: {salary}
+- Experience requirement: {experience}
+- Full job description: {jd}
+
+## Required analysis
+1. Split the JD into core responsibilities, required skills/tools/methods,
+   years or role level, and optional/preferred bonus items.
+2. Split each resume work experience and project into responsibilities,
+   outcomes, technologies, business context, and measurable evidence.
+3. Map every JD item to the strongest resume evidence. If no evidence exists,
+   state the gap explicitly. Do not invent experience.
+4. Calculate a 0-100 ability-match score with these weights:
+   - core responsibilities and project experience: 55%
+   - skills, tools, and methods: 25%
+   - years and role level: 15%
+   - industry background and optional bonuses: 5%
+   Optional or preferred items and industry background can add points but must
+   not create a hard deduction when absent. Assess salary separately as
+   pass, warning, fail, or not_provided; never mix salary into ability score.
+
+Return JSON only:
+{{
+  "score": 0,
+  "reason": "short evidence-based match summary",
+  "missing": "required gaps only",
+  "salary_assessment": "pass|warning|fail|not_provided",
+  "evidence_mapping": [
+    {{
+      "requirement": "JD requirement",
+      "category": "core|skill|experience|bonus",
+      "evidence": "resume evidence or empty string",
+      "match": "strong|partial|none",
+      "gap": "unproven gap or empty string"
+    }}
+  ]
+}}
 """
 
 
@@ -91,10 +171,17 @@ def _truncate_prompt_text(text: str, limit: int) -> str:
     return f"{text[:head]}{marker}{text[-(available - head):]}"
 
 
-def _build_scoring_prompt(job: dict, resume: str, *, compact: bool = False) -> str:
+def _build_scoring_prompt(
+    job: dict,
+    resume: str,
+    *,
+    compact: bool = False,
+    deep: bool = False,
+) -> str:
     resume_limit = 1400 if compact else 3000
     jd_limit = 900 if compact else 2000
-    return SCORING_PROMPT.format(
+    prompt = DEEP_SCORING_PROMPT if deep else SCORING_PROMPT
+    return prompt.format(
         resume=_truncate_prompt_text(resume, resume_limit),
         title=job["title"],
         company=job["company"],
@@ -124,7 +211,7 @@ def _parse_score_response(text: str) -> dict | None:
     return None
 
 
-def _validated_score_result(text: str) -> tuple[int, str] | None:
+def _validated_score_result(text: str, *, deep: bool = False) -> tuple | None:
     """Accept only complete scoring JSON with a bounded numeric score."""
     result = _parse_score_response(text)
     if not isinstance(result, dict) or "score" not in result:
@@ -139,7 +226,29 @@ def _validated_score_result(text: str) -> tuple[int, str] | None:
     if not reason:
         return None
     missing = str(result.get("missing") or "").strip()
-    return score, f"{reason} | 缺失: {missing}" if missing else reason
+    full_reason = f"{reason} | 缺失: {missing}" if missing else reason
+    if not deep:
+        return score, full_reason
+
+    raw_mapping = result.get("evidence_mapping")
+    evidence_mapping = []
+    if isinstance(raw_mapping, list):
+        for item in raw_mapping:
+            if not isinstance(item, dict) or not item.get("requirement"):
+                continue
+            evidence_mapping.append({
+                "requirement": str(item.get("requirement") or "").strip(),
+                "category": str(item.get("category") or "").strip(),
+                "evidence": str(item.get("evidence") or "").strip(),
+                "match": str(item.get("match") or "").strip(),
+                "gap": str(item.get("gap") or "").strip(),
+            })
+    if not evidence_mapping:
+        return None
+    salary_assessment = str(result.get("salary_assessment") or "not_provided").strip()
+    if salary_assessment not in {"pass", "warning", "fail", "not_provided"}:
+        salary_assessment = "not_provided"
+    return score, full_reason, evidence_mapping, salary_assessment
 
 
 def _report_progress(
@@ -168,7 +277,213 @@ def _record_score_failure(db, job: dict, detail: str) -> None:
     add_history(db, job["id"], "score_failed", safe_detail)
 
 
-def score_jobs(config: dict, *, rescore_filtered: bool = False) -> tuple[int, int]:
+def _apply_score_result(
+    db,
+    job: dict,
+    score: int,
+    full_reason: str,
+    threshold: int,
+    low_score_delete_threshold: int,
+    evidence: dict | None = None,
+) -> str:
+    """Persist one successful score and return its resulting category."""
+    if score < low_score_delete_threshold:
+        delete_job(db, job["id"])
+        return "deleted"
+    update_job_score(db, job["id"], score, full_reason, evidence=evidence)
+    if score >= threshold:
+        update_job_status(db, job["id"], "ready")
+        return "ready"
+    update_job_status(db, job["id"], "filtered")
+    return "filtered"
+
+
+_BATCH_STOP_ERROR_KINDS = {"token_quota", "rate_limit", "auth", "network", "request_failed"}
+
+
+def _score_deep_job(
+    job: dict,
+    resume: str,
+    config: dict,
+    max_attempts: int,
+    *,
+    deep: bool = False,
+) -> dict:
+    """Run one job's AI evaluation without touching shared database state."""
+    ai_cfg = config.get("ai", {}) if isinstance(config.get("ai"), dict) else {}
+    prompt = _build_scoring_prompt(job, resume, deep=deep)
+    try:
+        response = _call_claude(prompt, config)
+    except AIRequestError as exc:
+        if exc.kind in _BATCH_STOP_ERROR_KINDS:
+            return {"job": job, "pause_reason": exc.user_message}
+        if exc.kind == "output_truncated":
+            try:
+                tokens = min(max(int(ai_cfg.get("scoring_max_tokens", 8192) or 8192) * 2, 512), 65536)
+                response = _call_claude(prompt, config, tokens)
+            except AIRequestError as retry_exc:
+                if retry_exc.kind in _BATCH_STOP_ERROR_KINDS:
+                    return {"job": job, "pause_reason": retry_exc.user_message}
+                response = None
+        elif exc.kind == "output_limit":
+            try:
+                response = _call_claude(prompt, config, 128)
+            except AIRequestError as retry_exc:
+                if retry_exc.kind in _BATCH_STOP_ERROR_KINDS:
+                    return {"job": job, "pause_reason": retry_exc.user_message}
+                response = None
+        elif exc.kind == "context_limit":
+            try:
+                response = _call_claude(_build_scoring_prompt(job, resume, compact=True, deep=deep), config, 128)
+            except AIRequestError as retry_exc:
+                if retry_exc.kind in _BATCH_STOP_ERROR_KINDS:
+                    return {"job": job, "pause_reason": retry_exc.user_message}
+                response = None
+        else:
+            response = None
+
+    result = _validated_score_result(response, deep=deep) if response else None
+    for _attempt in range(2, max_attempts + 1):
+        if result is not None:
+            break
+        try:
+            response = _call_claude(prompt, config)
+        except AIRequestError as exc:
+            if exc.kind in _BATCH_STOP_ERROR_KINDS:
+                return {"job": job, "pause_reason": exc.user_message}
+            response = None
+        result = _validated_score_result(response, deep=deep) if response else None
+
+    if result is None:
+        return {"job": job, "failure": "AI did not return a complete score JSON"}
+    return {"job": job, "result": result}
+
+
+def _score_jobs_concurrently(
+    config: dict,
+    *,
+    rescore_filtered: bool = False,
+    job_ids: set[str] | None = None,
+) -> tuple[int, int]:
+    """Score pending jobs with bounded AI request concurrency."""
+    db = get_db()
+    try:
+        resume = _load_resume(config)
+        if not resume:
+            return 0, 0
+        if rescore_filtered:
+            reset_ai_filtered_jobs(db)
+
+        pending_jobs = get_jobs_by_status(db, "pending")
+        if job_ids is not None:
+            pending_jobs = [job for job in pending_jobs if str(job["id"]) in job_ids]
+        if not pending_jobs:
+            return 0, 0
+
+        threshold = config.get("scoring", {}).get("threshold", 60)
+        low_score_delete_threshold = get_low_score_delete_threshold(config)
+        deep = is_deep_scoring(config)
+        ai_cfg = config.get("ai", {}) if isinstance(config.get("ai"), dict) else {}
+        try:
+            max_attempts = max(1, min(int(ai_cfg.get("scoring_max_attempts", 2) or 2), 3))
+        except (TypeError, ValueError):
+            max_attempts = 2
+
+        eligible_jobs = []
+        scored = filtered = failed = processed = prefiltered = 0
+        for job in pending_jobs:
+            quick, reason = quick_score(job, config)
+            update_job_quick_score(db, job["id"], quick)
+            if quick == 0:
+                update_job_score(db, job["id"], quick, f"Prefilter rejected: {reason}")
+                update_job_status(db, job["id"], "filtered")
+                filtered += 1
+                prefiltered += 1
+                processed += 1
+                _report_progress(config, processed, len(pending_jobs), scored, filtered, failed)
+            else:
+                eligible_jobs.append(job)
+
+        stop_event = config.get("_workbench_stop_event")
+        pause_reason = ""
+        job_iterator = iter(eligible_jobs)
+        in_flight = {}
+
+        def submit_next(executor) -> bool:
+            if pause_reason or (stop_event is not None and stop_event.is_set()):
+                return False
+            try:
+                job = next(job_iterator)
+            except StopIteration:
+                return False
+            future = executor.submit(_score_deep_job, job, resume, config, max_attempts, deep=deep)
+            in_flight[future] = job
+            return True
+
+        with ThreadPoolExecutor(max_workers=get_scoring_concurrency(config)) as executor:
+            for _ in range(min(get_scoring_concurrency(config), len(eligible_jobs))):
+                submit_next(executor)
+
+            while in_flight:
+                done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                for future in done:
+                    outcome = future.result()
+                    job = in_flight.pop(future)
+                    if outcome.get("pause_reason"):
+                        pause_reason = outcome["pause_reason"]
+                    elif outcome.get("result"):
+                        result = outcome["result"]
+                        if deep:
+                            score, full_reason, evidence_mapping, salary_assessment = result
+                            evidence = {
+                                "salary_assessment": salary_assessment,
+                                "evidence_mapping": evidence_mapping,
+                            }
+                        else:
+                            score, full_reason = result
+                            evidence = None
+                        result_status = _apply_score_result(
+                            db,
+                            job,
+                            score,
+                            full_reason,
+                            threshold,
+                            low_score_delete_threshold,
+                            evidence,
+                        )
+                        if result_status == "ready":
+                            scored += 1
+                        else:
+                            filtered += 1
+                    else:
+                        failed += 1
+                        _record_score_failure(db, job, outcome.get("failure", "AI scoring failed"))
+
+                    processed += 1
+                    _report_progress(config, processed, len(pending_jobs), scored, filtered, failed)
+                    submit_next(executor)
+
+        if pause_reason:
+            _notify(config, f"AI scoring paused safely: {pause_reason}", error=True)
+        return scored, filtered
+    finally:
+        db.close()
+
+
+def score_jobs(
+    config: dict,
+    *,
+    rescore_filtered: bool = False,
+    job_ids: set[str] | None = None,
+) -> tuple[int, int]:
+    """Score pending jobs, using configured concurrency when explicitly available."""
+    ai_cfg = config.get("ai", {}) if isinstance(config.get("ai"), dict) else {}
+    if "scoring_concurrency" in ai_cfg or job_ids is not None:
+        return _score_jobs_concurrently(config, rescore_filtered=rescore_filtered, job_ids=job_ids)
+    return _score_jobs_sequential(config, rescore_filtered=rescore_filtered)
+
+
+def _score_jobs_sequential(config: dict, *, rescore_filtered: bool = False) -> tuple[int, int]:
     """Score all pending jobs. Returns (scored_count, filtered_count)."""
     db = get_db()
     try:
@@ -182,6 +497,8 @@ def score_jobs(config: dict, *, rescore_filtered: bool = False) -> tuple[int, in
             _notify(config, f"已将 {reset_count} 个 AI 低分岗位加入重新评分队列。")
 
         threshold = config.get("scoring", {}).get("threshold", 60)
+        low_score_delete_threshold = get_low_score_delete_threshold(config)
+        deep = is_deep_scoring(config)
         pending_jobs = get_jobs_by_status(db, "pending")
         if not pending_jobs:
             console.print("[yellow]没有待评分的岗位[/yellow]")
@@ -224,7 +541,7 @@ def score_jobs(config: dict, *, rescore_filtered: bool = False) -> tuple[int, in
 
                     # Stage 2: LLM deep evaluation
                     try:
-                        response = _call_claude(_build_scoring_prompt(job, resume), config)
+                        response = _call_claude(_build_scoring_prompt(job, resume, deep=deep), config)
                     except AIRequestError as exc:
                         if exc.kind == "output_truncated":
                             _notify(config, f"{job['company']}｜{job['title']} 的评分回答被截断，正在增大输出 Token 上限后重试。")
@@ -237,7 +554,7 @@ def score_jobs(config: dict, *, rescore_filtered: bool = False) -> tuple[int, in
                                 65536,
                             )
                             try:
-                                response = _call_claude(_build_scoring_prompt(job, resume), config, retry_tokens)
+                                response = _call_claude(_build_scoring_prompt(job, resume, deep=deep), config, retry_tokens)
                             except AIRequestError as retry_exc:
                                 if retry_exc.kind in {"output_truncated", "output_limit", "context_limit"}:
                                     failed += 1
@@ -252,7 +569,7 @@ def score_jobs(config: dict, *, rescore_filtered: bool = False) -> tuple[int, in
                         elif exc.kind == "output_limit":
                             _notify(config, f"{job['company']}｜{job['title']} 正在降低输出 Token 上限后重试评分。")
                             try:
-                                response = _call_claude(_build_scoring_prompt(job, resume), config, 128)
+                                response = _call_claude(_build_scoring_prompt(job, resume, deep=deep), config, 128)
                             except AIRequestError as retry_exc:
                                 if retry_exc.kind == "output_limit":
                                     failed += 1
@@ -270,7 +587,7 @@ def score_jobs(config: dict, *, rescore_filtered: bool = False) -> tuple[int, in
                         else:
                             _notify(config, f"{job['company']}｜{job['title']} 内容较长，正在压缩后重试评分。")
                             try:
-                                response = _call_claude(_build_scoring_prompt(job, resume, compact=True), config, 128)
+                                response = _call_claude(_build_scoring_prompt(job, resume, compact=True, deep=deep), config, 128)
                             except AIRequestError as retry_exc:
                                 if retry_exc.kind != "context_limit":
                                     pause_reason = retry_exc.user_message
@@ -283,7 +600,7 @@ def score_jobs(config: dict, *, rescore_filtered: bool = False) -> tuple[int, in
                     if not response:
                         result = None
                     else:
-                        result = _validated_score_result(response)
+                        result = _validated_score_result(response, deep=deep)
 
                     for attempt in range(2, max_attempts + 1):
                         if result is not None:
@@ -295,13 +612,13 @@ def score_jobs(config: dict, *, rescore_filtered: bool = False) -> tuple[int, in
                             f"{job['company']}｜{job['title']} 未返回完整评分，正在重试（{attempt}/{max_attempts}）。",
                         )
                         try:
-                            response = _call_claude(_build_scoring_prompt(job, resume), config)
+                            response = _call_claude(_build_scoring_prompt(job, resume, deep=deep), config)
                         except AIRequestError as retry_exc:
                             if retry_exc.kind in {"token_quota", "rate_limit", "auth", "network", "request_failed"}:
                                 pause_reason = retry_exc.user_message
                                 break
                             response = None
-                        result = _validated_score_result(response) if response else None
+                        result = _validated_score_result(response, deep=deep) if response else None
 
                     if pause_reason:
                         break
@@ -311,14 +628,27 @@ def score_jobs(config: dict, *, rescore_filtered: bool = False) -> tuple[int, in
                         _notify(config, f"已跳过 {job['company']}｜{job['title']}：AI 返回的评分格式无法解析。")
                         continue
 
-                    score, full_reason = result
-                    update_job_score(db, job["id"], score, full_reason)
-
-                    if score >= threshold:
-                        update_job_status(db, job["id"], "ready")
+                    if deep:
+                        score, full_reason, evidence_mapping, salary_assessment = result
+                        evidence = {
+                            "salary_assessment": salary_assessment,
+                            "evidence_mapping": evidence_mapping,
+                        }
+                    else:
+                        score, full_reason = result
+                        evidence = None
+                    result_status = _apply_score_result(
+                        db,
+                        job,
+                        score,
+                        full_reason,
+                        threshold,
+                        low_score_delete_threshold,
+                        evidence,
+                    )
+                    if result_status == "ready":
                         scored += 1
                     else:
-                        update_job_status(db, job["id"], "filtered")
                         filtered += 1
                 finally:
                     processed += 1

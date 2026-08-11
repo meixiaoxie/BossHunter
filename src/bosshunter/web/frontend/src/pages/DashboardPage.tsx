@@ -11,10 +11,12 @@ import {
   ExternalLink,
   Eye,
   MessageCircle,
+  Pause,
   Play,
   RefreshCw,
   Square,
   XCircle,
+  Trash2,
 } from 'lucide-react'
 
 type WorkbenchMode = 'full' | 'collect' | 'rescore' | 'monitor'
@@ -43,8 +45,8 @@ function currentTaskStage(logs: string[] = []) {
 function taskStatusText(status: string) {
   if (status === 'failed') return '运行失败'
   if (status === 'completed') return '已结束'
-  if (status === 'stopped') return '已停止'
-  if (status === 'stopping') return '停止中'
+  if (status === 'stopped') return '已暂停'
+  if (status === 'stopping') return '暂停中'
   return '运行中'
 }
 
@@ -245,13 +247,26 @@ function PreflightPanel({
 }
 
 export default function DashboardPage({ view = 'workbench' }: DashboardPageProps) {
-  const { workbench, jobs, history, loading, error, refresh, startTask, stopTask } = useDashboard(view)
+  const {
+    workbench,
+    jobs,
+    history,
+    loading,
+    error,
+    refresh,
+    startTask,
+    pauseTask,
+    resumeTask,
+    deleteTask,
+  } = useDashboard(view)
   const [selected, setSelected] = useState<string[]>([])
   const [notice, setNotice] = useState('')
   const [preflightChecks, setPreflightChecks] = useState<PreflightCheck[]>([])
   const [preflightMode, setPreflightMode] = useState<WorkbenchMode>('full')
   const [selectedJob, setSelectedJob] = useState<Job | null>(null)
   const [modePending, setModePending] = useState<WorkbenchMode | null>(null)
+  const [pausePending, setPausePending] = useState(false)
+  const [taskActionPending, setTaskActionPending] = useState(false)
   const [confirmedDeliveryIds, setConfirmedDeliveryIds] = useState<Set<string>>(new Set())
 
   const todayJobs = useMemo(
@@ -283,15 +298,54 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
     return true
   }
 
+  const handlePauseTask = async () => {
+    if (!activeTask || pausePending || activeTask.status === 'stopping') return
+    try {
+      setPausePending(true)
+      setNotice(`正在暂停${activeTask.label}，当前操作完成后会安全停止...`)
+      await pauseTask(activeTask.id)
+      setNotice(`${activeTask.label}已请求暂停；已入库和已评分岗位会保留。`)
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '暂停失败')
+    } finally {
+      setPausePending(false)
+    }
+  }
+
+  const handleResumeTask = async () => {
+    if (!visibleTask?.can_resume || taskActionPending || activeTask) return
+    if (!window.confirm(`是否继续${visibleTask.label}任务？系统只会处理原任务尚未完成的岗位。`)) return
+    try {
+      setTaskActionPending(true)
+      await resumeTask(visibleTask.id)
+      setNotice(`${visibleTask.label}已继续运行。`)
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '继续任务失败')
+    } finally {
+      setTaskActionPending(false)
+    }
+  }
+
+  const handleDeleteTask = async () => {
+    if (!visibleTask || activeTask || !['completed', 'failed', 'stopped'].includes(visibleTask.status) || taskActionPending) return
+    if (!window.confirm('确定删除这张任务卡吗？只会移除任务卡，不会删除岗位、评分、招呼语或历史记录。')) return
+    try {
+      setTaskActionPending(true)
+      await deleteTask(visibleTask.id)
+      setNotice('任务卡已删除，岗位和历史数据已保留。')
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '删除任务卡失败')
+    } finally {
+      setTaskActionPending(false)
+    }
+  }
+
   const handleModeClick = async (mode: WorkbenchMode) => {
     if (modePending) return
     try {
       if (activeTask?.mode === mode) {
-        if (window.confirm(`是否停止当前${activeTask.label}任务？已入库岗位会保留。`)) {
-          setModePending(mode)
-          setNotice(`正在停止${activeTask.label}...`)
-          await stopTask(activeTask.id)
-          setNotice(`${activeTask.label}已请求停止。`)
+        if (window.confirm(`是否暂停当前${activeTask.label}任务？已入库和已评分岗位会保留。`)) {
+          await handlePauseTask()
         }
         return
       }
@@ -433,7 +487,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
   }
 
   if (view === 'jobs') {
-    return <JobsPoolView jobs={jobs} />
+    return <JobsPoolView jobs={jobs} refresh={refresh} />
   }
 
   if (view === 'monitor') {
@@ -498,9 +552,46 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
                 <div className="text-sm font-black">任务运行状态</div>
                 <p className="mt-1 text-xs leading-5 text-muted">如果点击后浏览器没有反应，请先打开 BOSS 直聘并确认已登录；常见失败原因是 BOSS 未登录或 Chrome 调试连接不可用。</p>
               </div>
-              <span className="rounded-full bg-[#FFF0E5] px-3 py-1 text-xs font-black text-primary">
-                {visibleTask.label}
-              </span>
+              <div className="flex items-center gap-2">
+                {activeTask && (
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={handlePauseTask}
+                    disabled={pausePending || activeTask.status === 'stopping'}
+                  >
+                    <Pause className="mr-2 h-4 w-4" />
+                    {pausePending || activeTask.status === 'stopping' ? '暂停中...' : '暂停任务'}
+                  </Button>
+                )}
+                {!activeTask && visibleTask.can_resume && (
+                  <Button
+                    variant="secondary"
+                    size="icon"
+                    onClick={handleResumeTask}
+                    disabled={taskActionPending}
+                    title="继续任务"
+                    aria-label="继续任务"
+                  >
+                    <Play className="h-4 w-4" />
+                  </Button>
+                )}
+                {!activeTask && ['completed', 'failed', 'stopped'].includes(visibleTask.status) && (
+                  <Button
+                    variant="secondary"
+                    size="icon"
+                    onClick={handleDeleteTask}
+                    disabled={taskActionPending}
+                    title="删除任务卡"
+                    aria-label="删除任务卡"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                )}
+                <span className="rounded-full bg-[#FFF0E5] px-3 py-1 text-xs font-black text-primary">
+                  {visibleTask.label}
+                </span>
+              </div>
             </div>
             <div className={`mt-3 rounded-2xl border px-4 py-3 ${taskStatusClass(visibleTask.status)}`}>
               <div className="text-xs font-black text-primary">{taskStatusTitle(visibleTask.status)}</div>
@@ -713,6 +804,25 @@ function JobDetailModal({ job, onClose }: { job: Job; onClose: () => void }) {
           <div className="text-sm font-black">评分理由</div>
           <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-muted">{job.score_reason || '-'}</p>
         </div>
+        {job.score_evidence && (
+          <div className="mt-4 rounded-2xl border border-card-border bg-[#FFFCFA] p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="text-sm font-black">深度评分证据</div>
+              <span className="text-xs text-muted">薪资判断：{job.score_evidence.salary_assessment || 'not_provided'}</span>
+            </div>
+            {job.score_evidence.evidence_mapping?.length ? (
+              <div className="mt-3 space-y-3 text-sm">
+                {job.score_evidence.evidence_mapping.map((item, index) => (
+                  <div key={`${item.requirement}-${index}`} className="border-t border-card-border pt-3 first:border-t-0 first:pt-0">
+                    <p className="font-bold text-foreground">{item.requirement}</p>
+                    <p className="mt-1 leading-6 text-muted">证据：{item.evidence || '未提供'}</p>
+                    <p className="leading-6 text-muted">匹配：{item.match || '未提供'}{item.gap ? `；缺口：${item.gap}` : ''}</p>
+                  </div>
+                ))}
+              </div>
+            ) : <p className="mt-3 text-sm text-muted">本次深度评分未返回可核验证据。</p>}
+          </div>
+        )}
         <div className="mt-4 rounded-2xl border border-card-border bg-[#FFFCFA] p-4">
           <div className="text-sm font-black">招呼语</div>
           <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-muted">{job.greeting || '未生成'}</p>
@@ -735,7 +845,35 @@ function InfoBlock({ label, value }: { label: string; value: string }) {
   )
 }
 
-function JobsPoolView({ jobs }: { jobs: Job[] }) {
+function JobsPoolView({ jobs, refresh }: { jobs: Job[]; refresh: () => Promise<void> }) {
+  const [selectedIds, setSelectedIds] = useState<string[]>([])
+  const [scoring, setScoring] = useState(false)
+  const [notice, setNotice] = useState('')
+  const scorePending = async () => {
+    const pendingIds = jobs.filter(job => job.status === 'pending').map(job => job.id)
+    const jobIds = selectedIds.length ? selectedIds : pendingIds
+    if (!jobIds.length) return
+    setScoring(true)
+    try {
+      const res = await fetch('/api/workbench/task', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'score', job_ids: jobIds }),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || '启动批量评分失败')
+      }
+      setNotice(`已启动 ${jobIds.length} 个岗位的 AI 评分`)
+      setSelectedIds([])
+      await refresh()
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '启动批量评分失败')
+    } finally {
+      setScoring(false)
+    }
+  }
+
   return (
     <div className="rounded-3xl border border-card-border bg-white p-5">
       <div className="mb-4 flex items-center justify-between">
@@ -743,9 +881,15 @@ function JobsPoolView({ jobs }: { jobs: Job[] }) {
           <h2 className="text-2xl font-black">岗位池</h2>
           <p className="mt-1 text-sm text-muted">集中查看已采集岗位、AI 分数、状态和详情入口。</p>
         </div>
-        <BriefcaseBusiness className="h-6 w-6 text-primary" />
+        <div className="flex items-center gap-3">
+          <Button size="sm" disabled={scoring || !jobs.some(job => job.status === 'pending')} onClick={scorePending}>
+            <Play className="mr-2 h-4 w-4" />{scoring ? '启动中...' : selectedIds.length ? `评分已选 ${selectedIds.length} 项` : 'AI 批量评分'}
+          </Button>
+          <BriefcaseBusiness className="h-6 w-6 text-primary" />
+        </div>
       </div>
-      <JobsTable jobs={jobs} />
+      {notice && <div className="mb-3 rounded-md bg-[#FFF0E5] px-3 py-2 text-sm text-primary">{notice}</div>}
+      <JobsTable jobs={jobs} selectedIds={selectedIds} onSelectionChange={setSelectedIds} />
     </div>
   )
 }

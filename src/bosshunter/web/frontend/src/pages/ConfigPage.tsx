@@ -16,6 +16,8 @@ const CITIES = [
   '合肥', '厦门', '青岛', '大连'
 ]
 
+const BLOCKED_COMPANY_PRESETS = ['德科信息有限公司', '深德科', '中软国际科技服务有限公司']
+
 const AI_SERVICES = {
   anthropic: {
     label: 'Claude / Anthropic',
@@ -55,6 +57,13 @@ export default function ConfigPage() {
   const [resumeInfo, setResumeInfo] = useState<any>(null)
   const [resumeUploadError, setResumeUploadError] = useState('')
   const [aiTest, setAiTest] = useState<{ testing: boolean; ok?: boolean; message?: string }>({ testing: false })
+  const [cityError, setCityError] = useState('')
+
+  const unreadableSearchValues = config?._warnings?.unreadable_search_values || {}
+  const isUnreadableSearchValue = (value: unknown) => (
+    typeof value === 'string' && value.length > 0 && /^\?+$/.test(value)
+  )
+  const visibleKeywords = (config?.search?.keywords || []).filter((value: unknown) => !isUnreadableSearchValue(value))
 
   useEffect(() => {
     fetch('/api/resume').then(r => r.json()).then(setResumeInfo).catch(() => {})
@@ -133,6 +142,34 @@ export default function ConfigPage() {
     setAiTest({ testing: false })
   }
 
+  const updateCities = (cities: string[], cityCodes = config?.search?.city_codes || {}) => {
+    updateConfig('search.cities', cities)
+    const activeCityCodes = Object.fromEntries(
+      Object.entries(cityCodes).filter(([city]) => cities.includes(city))
+    )
+    updateConfig('search.city_codes', activeCityCodes)
+    updateConfig('profile.target_cities', cities)
+  }
+
+  const addCustomCity = async (city: string) => {
+    const currentCities = (config?.search?.cities?.length ? config.search.cities : config?.profile?.target_cities) || []
+    if (currentCities.includes(city)) return
+    setCityError('')
+    try {
+      const res = await fetch('/api/config/cities/lookup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ city }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || '城市查询失败')
+      const cityCodes = { ...(config?.search?.city_codes || {}), [data.name]: data.code }
+      updateCities([...currentCities, data.name], cityCodes)
+    } catch (error) {
+      setCityError(error instanceof Error ? error.message : '城市查询失败')
+    }
+  }
+
   if (loading) {
     return <div className="flex items-center justify-center h-full text-muted text-sm">加载中...</div>
   }
@@ -206,6 +243,25 @@ export default function ConfigPage() {
             <Field label="排除关键词">
               <TagsInput value={config.profile?.deal_breakers || []} onChange={v => updateConfig('profile.deal_breakers', v)} placeholder="如：外包、996" />
             </Field>
+            <Field label="公司屏蔽">
+              <TagsInput value={config.profile?.blocked_companies || []} onChange={v => updateConfig('profile.blocked_companies', v)} placeholder="输入公司名后按回车添加" />
+              <div className="mt-2 flex flex-wrap gap-2">
+                {BLOCKED_COMPANY_PRESETS.map(company => {
+                  const added = (config.profile?.blocked_companies || []).includes(company)
+                  return (
+                    <button
+                      key={company}
+                      type="button"
+                      disabled={added}
+                      onClick={() => updateConfig('profile.blocked_companies', [...(config.profile?.blocked_companies || []), company])}
+                      className={`rounded border px-2 py-1 text-xs transition-colors ${added ? 'border-card-border bg-[#FFFCFA] text-muted' : 'border-primary/40 bg-[#FFF0E5] text-primary hover:border-primary'}`}
+                    >
+                      {company}
+                    </button>
+                  )
+                })}
+              </div>
+            </Field>
             <div className="flex items-center justify-between">
               <label className="text-xs text-foreground">接受实习/管培岗位</label>
               <Switch checked={config.profile?.allow_internship ?? false} onChange={v => updateConfig('profile.allow_internship', v)} />
@@ -217,21 +273,26 @@ export default function ConfigPage() {
         <SectionCard title="搜索设置" sectionKey="search" expanded={expandedSections} toggle={toggleSection}>
           <div className="space-y-4">
             <Field label="搜索关键词">
-              <TagsInput value={config.search?.keywords || []} onChange={v => updateConfig('search.keywords', v)} />
+              <TagsInput value={visibleKeywords} onChange={v => updateConfig('search.keywords', v)} />
+              {unreadableSearchValues.keywords && (
+                <p className="mt-1 text-xs text-amber-600">发现 {unreadableSearchValues.keywords} 个无法读取的关键词，已隐藏。请重新输入后保存。</p>
+              )}
             </Field>
             <Field label="城市">
+              {(() => {
+                const cities = (config.search?.cities?.length ? config.search.cities : config.profile?.target_cities) || []
+                const visibleCities = cities.filter((city: string) => !isUnreadableSearchValue(city))
+                return <>
               <div className="flex flex-wrap gap-2">
                 {CITIES.map(city => {
-                  const cities = (config.search?.cities?.length ? config.search.cities : config.profile?.target_cities) || []
-                  const selected = cities.includes(city)
+                  const selected = visibleCities.includes(city)
                   return (
                     <button
                       key={city}
                       type="button"
                       onClick={() => {
-                        const newCities = selected ? cities.filter((c: string) => c !== city) : [...cities, city]
-                        updateConfig('search.cities', newCities)
-                        updateConfig('profile.target_cities', newCities)
+                        const newCities = selected ? visibleCities.filter((c: string) => c !== city) : [...visibleCities, city]
+                        updateCities(newCities)
                       }}
                       className={`px-2 py-1 text-xs rounded border transition-colors ${selected ? 'bg-primary/20 border-primary/50 text-primary' : 'border-card-border bg-[#FFFCFA] text-muted hover:border-primary/40 hover:text-foreground'}`}
                     >
@@ -240,9 +301,40 @@ export default function ConfigPage() {
                   )
                 })}
               </div>
+              <div className="mt-3">
+                <TagsInput
+                  value={visibleCities.filter((city: string) => !CITIES.includes(city))}
+                  onChange={customCities => {
+                    const builtInCities = visibleCities.filter((city: string) => CITIES.includes(city))
+                    const cityCodes = Object.fromEntries(
+                      Object.entries(config.search?.city_codes || {}).filter(([city]) => customCities.includes(city))
+                    )
+                    updateCities([...builtInCities, ...customCities], cityCodes)
+                  }}
+                  onAdd={addCustomCity}
+                  placeholder="输入城市后按回车添加"
+                />
+                {unreadableSearchValues.cities && (
+                  <p className="mt-1 text-xs text-amber-600">发现 {unreadableSearchValues.cities} 个无法读取的城市，已隐藏。请重新输入后保存。</p>
+                )}
+                {cityError && <p className="mt-2 text-xs text-red-500">{cityError}</p>}
+              </div>
+              </>
+              })()}
             </Field>
             <Field label="每关键词翻页数">
               <Input type="number" value={config.search?.max_pages || 3} onChange={e => updateConfig('search.max_pages', Number(e.target.value))} min={1} max={10} />
+            </Field>
+            <Field label="采集并发数">
+              <Input
+                type="number"
+                value={config.search?.collection_concurrency ?? 1}
+                onChange={e => updateConfig('search.collection_concurrency', Number(e.target.value))}
+                min={1}
+                max={3}
+                step={1}
+              />
+              <p className="mt-1 text-xs text-amber-700">提高并发可能触发平台风控，甚至导致账号限制或封号；建议保持默认值 1。</p>
             </Field>
           </div>
         </SectionCard>
@@ -252,6 +344,23 @@ export default function ConfigPage() {
           <div className="space-y-4">
             <Field label={`通过阈值: ${config.scoring?.threshold || 60}`}>
               <Slider value={config.scoring?.threshold || 60} onChange={v => updateConfig('scoring.threshold', v)} min={0} max={100} />
+            </Field>
+            <div className="flex items-center justify-between rounded-2xl border border-card-border bg-[#FFFCFA] p-4">
+              <div>
+                <label className="text-sm font-black text-foreground">深度证据评分</label>
+                <p className="mt-1 text-xs text-muted">开启后按 JD 逐项核验简历证据，返回匹配理由、缺失项和证据映射；评分会更慢。</p>
+              </div>
+              <Switch checked={config.scoring?.deep_scoring ?? false} onChange={v => updateConfig('scoring.deep_scoring', v)} />
+            </div>
+            <Field label="低分自动删除阈值">
+              <Input
+                type="number"
+                value={config.scoring?.low_score_delete_threshold ?? 50}
+                onChange={e => updateConfig('scoring.low_score_delete_threshold', Number(e.target.value))}
+                min={0}
+                max={100}
+              />
+              <p className="mt-1 text-xs text-muted">AI 评分完成后低于此分数的岗位永久删除；未评分岗位不会删除。</p>
             </Field>
             <Field label="每轮最大候选数">
               <Input type="number" value={config.scoring?.max_candidates || 20} onChange={e => updateConfig('scoring.max_candidates', Number(e.target.value))} min={1} max={100} />
@@ -363,6 +472,11 @@ export default function ConfigPage() {
                 min={5}
                 max={600}
               />
+            </Field>
+            <Field label="AI 评分并发数">
+              <Select value={String(config.ai?.scoring_concurrency || 3)} onChange={e => updateConfig('ai.scoring_concurrency', Number(e.target.value))}>
+                {[1, 2, 3, 4, 5].map(value => <option key={value} value={value}>{value}</option>)}
+              </Select>
             </Field>
             <div className="rounded-2xl border border-card-border bg-[#FFFCFA] p-3">
               <div className="flex flex-wrap items-center justify-between gap-3">

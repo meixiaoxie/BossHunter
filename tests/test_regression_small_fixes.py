@@ -518,6 +518,26 @@ class HeaderTests(unittest.TestCase):
         self.assertIn("本地服务运行中", self.source)
 
 
+    def test_header_polls_and_displays_boss_login_status(self):
+        self.assertIn("/api/browser/login-status", self.source)
+        self.assertIn("60000", self.source)
+        self.assertIn("BOSS 已登录", self.source)
+        self.assertIn("BOSS 未登录", self.source)
+
+    def test_dashboard_task_card_exposes_continue_and_delete_controls(self):
+        source = (
+            ROOT / "src" / "bosshunter" / "web" / "frontend" / "src" / "pages" / "DashboardPage.tsx"
+        ).read_text(encoding="utf-8")
+        hook_source = (
+            ROOT / "src" / "bosshunter" / "web" / "frontend" / "src" / "hooks" / "useDashboard.ts"
+        ).read_text(encoding="utf-8")
+        self.assertIn("can_resume", source)
+        self.assertIn("resumeTask", hook_source)
+        self.assertIn("deleteTask", hook_source)
+        self.assertIn("/resume", hook_source)
+        self.assertIn("method: 'DELETE'", hook_source)
+
+
 class ConfigPageTests(unittest.TestCase):
     def setUp(self):
         # Arrange
@@ -567,6 +587,10 @@ class ConfigPageTests(unittest.TestCase):
 
     def test_follow_up_switch_defaults_to_off_when_config_field_is_missing(self):
         self.assertIn("config.follow_up?.enabled ?? false", self.source)
+
+    def test_config_page_hides_and_explains_unreadable_city_values(self):
+        self.assertIn("visibleCities", self.source)
+        self.assertIn("unreadableSearchValues.cities", self.source)
 
 
 class ConfigSchemaTests(unittest.TestCase):

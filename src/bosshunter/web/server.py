@@ -7,16 +7,25 @@ Serves:
 
 import json
 import mimetypes
+import os
+import tempfile
 import time
 from copy import deepcopy
 from pathlib import Path
 from threading import Event, Lock
 
+import yaml
 from bottle import Bottle, request, response, static_file, abort
 
 from bosshunter import __version__
 from bosshunter.ai.credentials import get_ai_api_key
-from bosshunter.config import AI_SERVICE_PRESETS, CITY_CODES, load_config
+from bosshunter.config import (
+	AI_SERVICE_PRESETS,
+	CITY_CODES,
+	find_unreadable_search_values,
+	load_config,
+	normalize_scoring_config,
+)
 from bosshunter.db import (
 	add_history,
 	count_unresolved_monitor_items,
@@ -34,7 +43,9 @@ from bosshunter.db import (
 	update_job_status,
 )
 from bosshunter.web.preflight import check_ai_connection, collect_preflight_checks, error_messages
+from bosshunter.browser.diagnostics import get_boss_login_status
 from bosshunter.web.resume_upload import ResumeUploadError, prepare_resume_content
+from bosshunter.web.city_lookup import CityLookupError, lookup_city
 from bosshunter.web.tasks import TaskAlreadyRunningError, WorkbenchTask, WorkbenchTaskRunner
 
 mimetypes.add_type("application/javascript", ".js", strict=True)
@@ -67,6 +78,19 @@ BASE_DIR = _default_base_dir()
 DATA_DIR = BASE_DIR / "data"
 RESUME_DIR = DATA_DIR / "resumes"
 CONFIG_PATH = BASE_DIR / "config.yaml"
+
+
+def _serialize_job(job: dict) -> dict:
+	"""Expose persisted score evidence as structured JSON for the dashboard."""
+	data = dict(job)
+	raw_evidence = data.get("score_evidence")
+	if isinstance(raw_evidence, str) and raw_evidence.strip():
+		try:
+			parsed = json.loads(raw_evidence)
+			data["score_evidence"] = parsed if isinstance(parsed, dict) else None
+		except (TypeError, ValueError):
+			data["score_evidence"] = None
+	return data
 
 
 def set_base_dir(base_dir: Path | str) -> None:
@@ -128,12 +152,53 @@ def _redact_config_for_response(config):
 		auth_token = ai_cfg.pop("auth_token", None)
 		if auth_token:
 			ai_cfg["auth_token_masked"] = _mask_api_key(str(auth_token))
+	warnings = find_unreadable_search_values(redacted)
+	if warnings:
+		redacted["_warnings"] = {"unreadable_search_values": warnings}
 	return redacted
+
+
+def _config_download_payload(config: dict) -> str:
+	"""Serialize a shareable config backup without credentials."""
+	redacted = _redact_config_for_response(config)
+	ai_cfg = redacted.get("ai")
+	if isinstance(ai_cfg, dict):
+		ai_cfg.pop("api_key_masked", None)
+		ai_cfg.pop("auth_token_masked", None)
+	return yaml.dump(redacted, allow_unicode=True, default_flow_style=False, sort_keys=False)
+
+
+def _write_config(config: dict) -> None:
+	"""Atomically replace config.yaml so an interrupted write cannot corrupt it."""
+	CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+	temporary_path = None
+	try:
+		with tempfile.NamedTemporaryFile(
+			"w",
+			encoding="utf-8",
+			dir=CONFIG_PATH.parent,
+			prefix=f".{CONFIG_PATH.name}.",
+			suffix=".tmp",
+			delete=False,
+		) as temporary:
+			temporary_path = Path(temporary.name)
+			yaml.dump(config, temporary, allow_unicode=True, default_flow_style=False, sort_keys=False)
+			temporary.flush()
+			os.fsync(temporary.fileno())
+		os.replace(temporary_path, CONFIG_PATH)
+		temporary_path = None
+	finally:
+		if temporary_path is not None:
+			try:
+				temporary_path.unlink()
+			except FileNotFoundError:
+				pass
 
 
 def _sanitize_config_for_write(data):
 	"""Remove browser-only fields and preserve existing secrets on blank posts."""
 	cleaned = deepcopy(data)
+	cleaned.pop("_warnings", None)
 	ai_cfg = cleaned.get("ai")
 	if not isinstance(ai_cfg, dict):
 		return cleaned
@@ -180,7 +245,7 @@ def _sanitize_config_for_write(data):
 def _preflight_messages(mode: str, config: dict) -> list[str]:
 	"""Return user-actionable blockers before starting a dashboard task."""
 	messages: list[str] = []
-	if mode not in {"full", "collect", "rescore", "monitor"}:
+	if mode not in {"full", "collect", "rescore", "score", "monitor"}:
 		messages.append(f"不支持的任务模式：{mode}")
 
 	profile = config.get("profile", {})
@@ -191,10 +256,18 @@ def _preflight_messages(mode: str, config: dict) -> list[str]:
 	if mode in {"full", "collect"} and not config.get("search", {}).get("keywords"):
 		messages.append("请先在配置页填写搜索关键词。")
 
-	if mode in {"full", "collect", "rescore"} and not get_ai_api_key(config):
+	if mode in {"full", "collect", "rescore", "score"} and not get_ai_api_key(config):
 		messages.append("请先在配置页填写当前 AI 服务的 API Key，或设置对应的标准环境变量。")
 
 	return messages
+
+
+def _boss_login_message(config: dict) -> str | None:
+	"""Return the shared task-start blocker when BOSS is unavailable."""
+	login_status = get_boss_login_status(config)
+	if login_status.get("ready"):
+		return None
+	return str(login_status.get("message") or "请先在 Chrome 中登录 BOSS 直聘。")
 
 
 def _task_config(extra: dict | None = None) -> dict:
@@ -214,7 +287,10 @@ def _execute_collect(task: WorkbenchTask, config: dict) -> None:
 
 	keywords = config.get("search", {}).get("keywords", [])
 	_log(task, "开始采集岗位")
-	scrape_jobs(config, keywords)
+	new_job_ids: set[str] = set()
+	collect_config = dict(config)
+	collect_config["_workbench_stop_event"] = task.stop_requested
+	scrape_jobs(collect_config, keywords, new_job_ids=new_job_ids)
 	if task.stop_requested.is_set():
 		return
 	_log(task, "开始 AI 评分")
@@ -225,7 +301,7 @@ def _execute_collect(task: WorkbenchTask, config: dict) -> None:
 		task,
 		f"AI 评分进度 {state['completed']}/{state['total']}：通过 {state['scored']}，过滤 {state['filtered']}，失败 {state['failed']}",
 	)
-	score_jobs(score_config)
+	score_jobs(score_config, job_ids=new_job_ids)
 
 
 def _execute_rescore(task: WorkbenchTask, config: dict) -> None:
@@ -240,6 +316,21 @@ def _execute_rescore(task: WorkbenchTask, config: dict) -> None:
 	)
 	_log(task, "开始重新评分")
 	score_jobs(score_config, rescore_filtered=True)
+
+
+def _execute_score(task: WorkbenchTask, config: dict) -> None:
+	from bosshunter.ai.scorer import score_jobs
+
+	job_ids = {str(job_id) for job_id in config.get("_workbench_score_job_ids", []) if str(job_id)}
+	score_config = dict(config)
+	score_config["_workbench_stop_event"] = task.stop_requested
+	score_config["_workbench_log"] = lambda message: _log(task, message)
+	score_config["_workbench_score_progress"] = lambda state: _log(
+		task,
+		f"AI 评分进度 {state['completed']}/{state['total']}：通过 {state['scored']}，过滤 {state['filtered']}，失败 {state['failed']}",
+	)
+	_log(task, "开始批量评分")
+	score_jobs(score_config, job_ids=job_ids or None)
 
 
 def _queue_monitor_delivery(
@@ -428,6 +519,7 @@ task_runner._executors.update({
 	"full": _execute_full,
 	"collect": _execute_collect,
 	"rescore": _execute_rescore,
+	"score": _execute_score,
 	"monitor": _execute_monitor,
 	"deliver": _execute_deliver,
 })
@@ -478,6 +570,8 @@ def api_jobs():
 	status_filter = request.params.get("status", None)
 	limit = int(request.params.get("limit", 100))
 	offset = int(request.params.get("offset", 0))
+	if limit < 0 or offset < 0:
+		return _json_response({"error": "limit and offset must be non-negative"}, 400)
 
 	db = _get_web_db()
 	try:
@@ -486,11 +580,16 @@ def api_jobs():
 		if status_filter:
 			query += " WHERE status = ?"
 			params.append(status_filter)
-		query += " ORDER BY score DESC, created_at DESC LIMIT ? OFFSET ?"
-		params.extend([limit, offset])
+		query += " ORDER BY score DESC, created_at DESC"
+		if limit:
+			query += " LIMIT ? OFFSET ?"
+			params.extend([limit, offset])
+		elif offset:
+			query += " LIMIT -1 OFFSET ?"
+			params.append(offset)
 
 		rows = db.execute(query, params).fetchall()
-		jobs = [dict(row) for row in rows]
+		jobs = [_serialize_job(dict(row)) for row in rows]
 		return _json_response(jobs)
 	finally:
 		db.close()
@@ -548,12 +647,12 @@ def api_workbench():
 		return _json_response({
 			"funnel": get_funnel_stats(db),
 			"pending_confirmation": [
-				job for job in get_jobs_pending_confirmation(db)
+				_serialize_job(job) for job in get_jobs_pending_confirmation(db)
 				if int(job.get("score") or 0) >= threshold
 			],
-			"pending_greetings": get_jobs_ready_to_send(db),
-			"send_errors": get_jobs_with_send_errors(db),
-			"needs_resume": get_jobs_needing_resume(db),
+			"pending_greetings": [_serialize_job(job) for job in get_jobs_ready_to_send(db)],
+			"send_errors": [_serialize_job(job) for job in get_jobs_with_send_errors(db)],
+			"needs_resume": [_serialize_job(job) for job in get_jobs_needing_resume(db)],
 			"task": status["active"],
 			"last_task": status["last_task"],
 		})
@@ -583,15 +682,34 @@ def api_ai_diagnostics():
 		return _json_response({"ok": False, "messages": [str(e)]}, 500)
 
 
+@app.route("/api/browser/login-status")
+def api_boss_login_status():
+	try:
+		return _json_response(get_boss_login_status(load_config(CONFIG_PATH)))
+	except Exception as e:
+		return _json_response({
+			"ready": False,
+			"status": "unavailable",
+			"message": f"无法检查 BOSS 登录状态：{e}",
+		}, 500)
+
+
 @app.route("/api/workbench/task", method="POST")
 def api_workbench_task_start():
 	try:
 		body = request.json or {}
 		mode = body.get("mode", "")
-		messages = _preflight_messages(mode, load_config(CONFIG_PATH))
+		config = load_config(CONFIG_PATH)
+		messages = _preflight_messages(mode, config)
+		login_message = _boss_login_message(config)
+		if login_message:
+			messages.append(login_message)
 		if messages:
 			return _json_response({"error": "请先处理启动前检查", "messages": messages}, 400)
-		task = task_runner.start(mode, _task_config())
+		extra = {}
+		if mode == "score":
+			extra["_workbench_score_job_ids"] = body.get("job_ids", [])
+		task = task_runner.start(mode, _task_config(extra))
 		return _json_response(task)
 	except TaskAlreadyRunningError as e:
 		return _json_response({"error": str(e)}, 409)
@@ -609,6 +727,52 @@ def api_workbench_task_stop(task_id):
 		return _json_response({"error": str(e)}, 500)
 
 
+@app.route("/api/workbench/task/<task_id>/pause", method="POST")
+def api_workbench_task_pause(task_id):
+	try:
+		return _json_response(task_runner.stop(task_id, "用户已请求暂停，当前操作完成后安全停止"))
+	except KeyError:
+		return _json_response({"error": "任务不存在"}, 404)
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
+@app.route("/api/workbench/task/<task_id>/resume", method="POST")
+def api_workbench_task_resume(task_id):
+	try:
+		source_task = task_runner._tasks.get(task_id)
+		if not source_task:
+			return _json_response({"error": "任务不存在"}, 404)
+		descriptor = source_task.context.get("resume")
+		mode = descriptor.get("mode") if isinstance(descriptor, dict) else ""
+		config = load_config(CONFIG_PATH)
+		messages = [] if mode == "deliver" else _preflight_messages(mode, config)
+		login_message = _boss_login_message(config)
+		if login_message:
+			messages.append(login_message)
+		if messages:
+			return _json_response({"error": "请先处理启动前检查", "messages": messages}, 400)
+		return _json_response(task_runner.resume(task_id, config))
+	except KeyError:
+		return _json_response({"error": "任务不存在"}, 404)
+	except (TaskAlreadyRunningError, ValueError) as e:
+		return _json_response({"error": str(e)}, 409)
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
+@app.route("/api/workbench/task/<task_id>", method="DELETE")
+def api_workbench_task_delete(task_id):
+	try:
+		return _json_response(task_runner.delete(task_id))
+	except KeyError:
+		return _json_response({"error": "任务不存在"}, 404)
+	except TaskAlreadyRunningError as e:
+		return _json_response({"error": str(e)}, 409)
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
 @app.route("/api/workbench/deliver", method="POST")
 def api_workbench_deliver():
 	try:
@@ -616,6 +780,9 @@ def api_workbench_deliver():
 		job_ids = [str(job_id) for job_id in body.get("job_ids", []) if str(job_id)]
 		if not job_ids:
 			return _json_response({"error": "请选择要投递的岗位"}, 400)
+		login_message = _boss_login_message(load_config(CONFIG_PATH))
+		if login_message:
+			return _json_response({"error": login_message}, 400)
 
 		direct_send = bool(body.get("direct_send"))
 		db = _get_web_db()
@@ -698,7 +865,7 @@ def api_job_detail(job_id):
 		row = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
 		if not row:
 			return _json_response({"error": "岗位不存在"}, 404)
-		return _json_response(dict(row))
+		return _json_response(_serialize_job(dict(row)))
 	finally:
 		db.close()
 
@@ -821,6 +988,7 @@ def api_config_post():
 		if not isinstance(data, dict):
 			return _json_response({"error": "Config body must be an object"}, 400)
 		data = _sanitize_config_for_write(data)
+		normalize_scoring_config(data)
 
 		# Basic validation
 		profile = data.get("profile", {})
@@ -828,8 +996,7 @@ def api_config_post():
 			return _json_response({"error": "salary_min must be <= salary_max"}, 400)
 
 		# Write YAML (backend exclusively owns YAML serialization)
-		with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-			yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+		_write_config(data)
 
 		return _json_response({"success": True, "message": "配置已保存"})
 	except Exception as e:
@@ -851,13 +1018,23 @@ def api_config_download():
 	if CONFIG_PATH.exists():
 		response.content_type = "application/x-yaml; charset=utf-8"
 		response.headers["Content-Disposition"] = "attachment; filename=config.yaml"
-		return CONFIG_PATH.read_text(encoding="utf-8")
+		return _config_download_payload(load_config(CONFIG_PATH))
 	abort(404, "config.yaml not found")
 
 
 @app.route("/api/config/cities")
 def api_cities():
 	return _json_response(CITY_CODES)
+
+
+@app.route("/api/config/cities/lookup", method="POST")
+def api_city_lookup():
+	try:
+		body = request.json or {}
+		city = str(body.get("city") or "")
+		return _json_response(lookup_city(city))
+	except CityLookupError as exc:
+		return _json_response({"error": str(exc)}, 400)
 
 
 # ─── Resume APIs ─────────────────────────────────────────
@@ -905,8 +1082,7 @@ def api_resume_upload():
 		# Update config
 		config = load_config(CONFIG_PATH)
 		config.setdefault("profile", {})["resume_path"] = str(dest)
-		with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-			yaml.dump(config, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+		_write_config(config)
 
 		return _json_response({
 			"success": True,
@@ -928,8 +1104,7 @@ def api_resume_delete():
 
 		# Never delete the master resume from disk; only detach it from config.
 		config.setdefault("profile", {})["resume_path"] = ""
-		with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-			yaml.dump(config, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+		_write_config(config)
 
 		return _json_response({"success": True})
 	except Exception as e:
